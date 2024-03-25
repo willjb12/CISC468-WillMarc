@@ -1,34 +1,86 @@
 package main
 
 import (
+	"bufio"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
+	"math/rand"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/mdns"
+	"github.com/likexian/selfca"
 )
 
 type chatRequest struct {
-	srcIP   net.IP
-	dstIP   net.IP
-	srcUser string
-	dstUser string
+	IP   net.IP
+	User string
 }
 
-type ControlWrite struct {
-	Writer io.Writer
+type HostID struct {
+	Hostname string
+	ID       string
 }
 
-func (cw *ControlWrite) Write(p []byte) (n int, err error) {
-	if strings.HasPrefix(string(p), "sm> ") || string(p) == "sm> " {
-		return cw.Writer.Write(p)
+// structure to hold open TLS connections
+type TLSConnectionStore struct {
+	connections  map[string]*ConnectionInfo
+	TLStoreMutex sync.Mutex
+}
+
+// structure to hold the writer and request associated to a TLS connection
+type ConnectionInfo struct {
+	cert       *x509.Certificate
+	conn       *tls.Conn
+	InboxMutex sync.Mutex
+}
+
+// initialize the store
+func NewTLSConnectionStore() *TLSConnectionStore {
+	return &TLSConnectionStore{
+		connections: make(map[string]*ConnectionInfo),
 	}
-	return len(p), nil
 }
+
+// add a connection to the store
+func (s *TLSConnectionStore) Add(id string, info *ConnectionInfo) {
+	s.TLStoreMutex.Lock()
+	defer s.TLStoreMutex.Unlock()
+	s.connections[id] = info
+}
+
+// remove a connection from the store
+func (s *TLSConnectionStore) Remove(id string) {
+	s.TLStoreMutex.Lock()
+	defer s.TLStoreMutex.Unlock()
+	delete(s.connections, id)
+}
+
+// declare the store as global variable
+var (
+	store *TLSConnectionStore
+)
+
+// to dynamically add certificates to the pool
+var (
+	tlsConfig    *tls.Config
+	addCertMutex sync.Mutex
+)
+
+// to add hostids to the hostids file
+var (
+	addHostIdMutex sync.Mutex
+)
 
 func print_nice_columns(discovered []*mdns.ServiceEntry) {
 	var userNum string
@@ -62,21 +114,6 @@ func announce_presence() *mdns.Server {
 	return server
 }
 
-func default_interface() net.IP {
-	defaultRoute, _ := net.InterfaceAddrs()
-
-	var defaultIP net.IP
-	for _, addr := range defaultRoute {
-		ipNet, ok := addr.(*net.IPNet)
-		if ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			defaultIP = ipNet.IP
-			break
-		}
-	}
-
-	return defaultIP
-}
-
 func peer_discovery() []*mdns.ServiceEntry {
 	params := mdns.DefaultParams("_securemessaging._udp")
 
@@ -108,7 +145,7 @@ func peer_discovery() []*mdns.ServiceEntry {
 }
 
 func initiate_chat() {
-	incomingRequestChan := make(chan chatRequest)
+
 	peerSelectionChan := make(chan chatRequest)
 	quitChan := make(chan struct{})
 	pauseDiscoveryChan := make(chan struct{})
@@ -127,9 +164,9 @@ func initiate_chat() {
 			fmt.Scanln(&input)
 
 			if strings.ToLower(input) == "refresh" {
-				fmt.Println("refreshing available users")
+				fmt.Println("\nrefreshing available users")
 			} else if strings.ToLower(input) == "back" {
-				fmt.Println("going back to main screen")
+				fmt.Println("\ngoing back to main screen")
 				quitChan <- struct{}{}
 				<-pauseDiscoveryChan
 			} else {
@@ -146,9 +183,8 @@ func initiate_chat() {
 					fmt.Println("\nHost not found. Check your typing.")
 					continue
 				} else {
-					host, _ := os.Hostname()
-					myIP := default_interface()
-					selection := chatRequest{srcIP: myIP, dstIP: selectedEntry.AddrV4, srcUser: host, dstUser: selectedEntry.Host}
+					host := selectedEntry.Host[:len(selectedEntry.Host)-1]
+					selection := chatRequest{IP: selectedEntry.AddrV4, User: host}
 
 					peerSelectionChan <- selection
 					<-pauseDiscoveryChan
@@ -157,61 +193,28 @@ func initiate_chat() {
 		}
 	}()
 
-	// listen for connection requests
-	// parse a received request and send it to the incoming requests chan
-	go func() {
-		addr, err := net.ResolveUDPAddr("udp", ":60001")
-		if err != nil {
-			fmt.Println("Could not resolve address")
-			return
-		}
-
-		conn, err := net.ListenUDP("udp", addr)
-		if err != nil {
-			fmt.Println("Could not create connection")
-			return
-		}
-
-		defer conn.Close()
-
-		buffer := make([]byte, 1024)
-		for {
-			n, _, _ := conn.ReadFromUDP(buffer)
-
-			request := string(buffer[:n])
-			incomingRequestChan <- chatRequest{srcIP: net.ParseIP("0.0.0.0"), dstIP: net.ParseIP("0.0.0.0"), srcUser: request, dstUser: "me"}
-		}
-	}()
-
 	for {
 		select {
 		case selection := <-peerSelectionChan:
 
 			fmt.Println("\nYou have selected a user")
-
-			destination := selection.dstIP.String() + ":" + "60001"
-			serverAddr, err := net.ResolveUDPAddr("udp", destination)
+			dstHostID, err := setup_chat_with(selection)
 			if err != nil {
-				fmt.Println("Could not resolve address")
-				continue
-			}
-			conn, err := net.DialUDP("udp", nil, serverAddr)
-			if err != nil {
-				fmt.Println("Could not create connection")
-				continue
-			}
-			message := []byte("Hello")
-			_, err = conn.Write(message)
-			if err != nil {
-				fmt.Println("could not send message")
+				fmt.Printf("could not complete initial setup with %s: %v", selection.User, err)
+				pauseDiscoveryChan <- struct{}{}
 				continue
 			}
 
-			conn.Close()
+			fmt.Printf("You have completed the initial setup with %s!\n", dstHostID.Hostname)
+
+			err = establish_tls_chat(dstHostID, selection.IP)
+			if err != nil {
+				fmt.Printf("error establishing secure connection: %v", err)
+				pauseDiscoveryChan <- struct{}{}
+				continue
+			}
+
 			pauseDiscoveryChan <- struct{}{}
-		case request := <-incomingRequestChan:
-			fmt.Println("\nA user is trying to connect to you.")
-			fmt.Println(request.srcUser)
 		case <-quitChan:
 
 			return
@@ -220,9 +223,699 @@ func initiate_chat() {
 	}
 }
 
-// takes an ip address that you wish to chat with and attempts to initiate a connection
-func chat_with(net.IP) string {
-	return "quit"
+func setup_chat_with(selection chatRequest) (HostID, error) {
+	// create HostID of destination user
+	var dstHostID HostID
+
+	destination := selection.IP.String() + ":" + "7777"
+	serverAddr, err := net.ResolveTCPAddr("tcp", destination)
+	if err != nil {
+		return dstHostID, fmt.Errorf("could not resolve address: %v", err)
+	}
+	conn, err := net.DialTCP("tcp", nil, serverAddr)
+	if err != nil {
+		return dstHostID, fmt.Errorf("could not create connection: %v", err)
+	}
+
+	fmt.Printf("The connection was successful\n")
+
+	// get own id to send over connection
+	myId, _ := get_id()
+
+	// write own id to connection
+	conn.Write([]byte(myId))
+
+	fmt.Printf("Successfully wrote id to connection\n")
+
+	// read from connection
+	buffer := make([]byte, 2048)
+	n, _ := conn.Read(buffer)
+
+	response := buffer[:n]
+
+	// check if it is a certificate
+	block, _ := pem.Decode(response)
+
+	if block == nil { // if it is not a certificate then it is an id
+		clientId := string(response)
+
+		// check if it is a valid id (at least 4 digits long)
+		if len(clientId) < 4 {
+			return dstHostID, fmt.Errorf("the provided id is too short")
+		}
+
+		// double check whether the user is in your contacts
+		// if found, match will be the HostID of the contact
+		// selection.dstUser is the advertised hostname from mdns
+		found, dstHostID, err := check_contact(clientId)
+		if err != nil {
+			return dstHostID, fmt.Errorf("error while checking for contact existence: %v", err)
+		}
+
+		if found && dstHostID.Hostname == selection.User { // we found the id in our contacts and they have the correct host name
+			// return the dstHostID, no errors occurred
+			return dstHostID, nil
+
+		} else if found && dstHostID.Hostname != selection.User { // we found the id in our contacts and they have a different host name
+			fmt.Printf("dstUser: %s\nmatch.Hostname: %s\n", selection.IP, dstHostID.Hostname)
+			return dstHostID, fmt.Errorf("the id provided belongs to a different user")
+
+		} else { // we did not find the id in our contacts, yet the dest user already has our id
+			return dstHostID, fmt.Errorf("the id was not found in your contacts, another user may be using your id")
+		}
+
+	} else { // if it is a certificate then add the user to contacts and send back own certificate
+		// add the user to contacts
+		dstHostID, err := add_new_contact(block)
+		if err != nil {
+			return dstHostID, fmt.Errorf("error adding new contact: %v", err)
+		}
+
+		// send own certificate over the connection
+		// get own certificate
+		cert, err := os.ReadFile("my.crt")
+		if err != nil {
+			return dstHostID, fmt.Errorf("error occurred while reading own cert from file: %v", err)
+		}
+
+		// write own certificate to connection
+		_, err = conn.Write([]byte(cert))
+		if err != nil {
+			return dstHostID, fmt.Errorf("error occurred while writing own cert to connection: %v", err)
+		}
+
+		// return the dstHostID, no errors occurred
+		return dstHostID, nil
+	}
+}
+
+func tcp_connection_handler(conn net.Conn) {
+
+	buffer := make([]byte, 2048)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	message := buffer[:n]
+
+	yourId := string(message)
+
+	if len(yourId) < 4 {
+		fmt.Printf("Invalid id")
+		conn.Close()
+		return
+	}
+
+	fmt.Printf("receieved request from id %s\n", yourId)
+
+	// check whether the user is in your contacts
+	found, _, err := check_contact(yourId)
+	if err != nil {
+		fmt.Printf("error occurred while checking for contact existenct: %v", err)
+		conn.Close()
+		return
+	}
+
+	if found { // if so then send your own id
+		myId, err := get_id()
+		if err != nil {
+			conn.Close()
+			return
+		}
+
+		// send my id over the connection
+		_, err = conn.Write([]byte(myId))
+		if err != nil {
+			fmt.Printf("error occurred while writing own id to connection: %v", myId)
+			conn.Close()
+			return
+		}
+	} else { // otherwise exchange certificates with user
+		// get own certificate
+		cert, err := os.ReadFile("my.crt")
+		if err != nil {
+			fmt.Printf("error occurred while reading own cert from file: %v", err)
+			conn.Close()
+			return
+		}
+
+		// write own certificate to connection
+		_, err = conn.Write([]byte(cert))
+		if err != nil {
+			fmt.Printf("error occurred while writing own cert to connection: %v", err)
+			conn.Close()
+			return
+		}
+
+		// read clients certificate from connection
+		buffer := make([]byte, 2048)
+		n, err := conn.Read(buffer)
+		if err != nil {
+			fmt.Printf("error occurred while reading client certificate from buffer")
+			conn.Close()
+			return
+		}
+
+		clientCert := buffer[:n]
+		// check if it is a certificate
+		block, _ := pem.Decode(clientCert)
+		if block != nil {
+			_, err := add_new_contact(block)
+			if err != nil {
+				conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// Handle incoming connections from other users
+func tls_connection_handler(w http.ResponseWriter, r *http.Request) {
+
+	// get the client certificate
+	clientCert := r.TLS.PeerCertificates[0]
+
+	// extract the host name from the certificate
+	hostName := clientCert.Subject.CommonName
+
+	// extract the id from the certificate
+	id := clientCert.DNSNames[0]
+
+	// construct the user id
+	username := hostName + "#" + id[len(id)-4:]
+
+	// open the correct inbox file
+	inboxPath := filepath.Join("inbox", id+".txt")
+	file, err := os.Create(inboxPath)
+	if err != nil {
+		log.Printf("failed to open the inbox file: %v", err)
+	}
+
+	// hijack the underlying connection
+	underlyingConn, _, _ := w.(http.Hijacker).Hijack()
+	conn, ok := underlyingConn.(*tls.Conn)
+	if !ok {
+		underlyingConn.Close()
+		return
+	}
+
+	fmt.Printf("Hijacked underlying connection")
+
+	// create connection to add to the store
+	connection := ConnectionInfo{
+		cert: clientCert,
+		conn: conn,
+	}
+
+	// add connection to the store
+	store.Add(id, &connection)
+
+	fmt.Printf("Added connection to store")
+
+	// persistently read messages from the connection and write them to the inbox
+	for {
+		buffer := make([]byte, 1024)
+
+		n, err := conn.Read(buffer)
+		if err != nil {
+			break
+		}
+
+		write_to_inbox(file, username, string(buffer[:n]), &connection.InboxMutex)
+	}
+
+	store.Remove(id)
+}
+
+func establish_tls_chat(userID HostID, ip net.IP) error {
+
+	// initialize the *tls.Conn
+	var conn *tls.Conn
+
+	// boolean for whether the connection was in the store
+	found := false
+
+	// inboxMutex mutex lock
+	var inboxMutex *sync.Mutex
+
+	// check whether a connection already exists with the user
+	store.TLStoreMutex.Lock()
+	for idKey := range store.connections {
+		if idKey == userID.ID { // there is already an existing connection with the user, being handled by a tls_connection_handler routine
+
+			fmt.Print("An open connection with the user was found, getting details from store")
+
+			conn = store.connections[idKey].conn
+
+			// get the request and check whether it is a certificate for that user
+			cert := store.connections[idKey].cert
+			if cert.DNSNames[0] != userID.ID {
+				return fmt.Errorf("the certificate used to authenticate did not belong to the identity that the user identified itself as")
+			}
+
+			// get the inboxMutex
+			inboxMutex = &store.connections[idKey].InboxMutex // assign the mutex lock associated to this connections inbox to the initalized variable
+			found = true                                      // the connection was found within the store
+			break
+		}
+	}
+	store.TLStoreMutex.Unlock() // unlock the store mutex
+
+	// open the correct inbox file
+	inboxPath := filepath.Join("inbox", userID.ID+".txt")
+	file, err := os.Create(inboxPath)
+	if err != nil {
+		return fmt.Errorf("failed to open the inbox file: %v", err)
+	}
+
+	// construct the user id
+	username := userID.Hostname + "#" + userID.ID[len(userID.ID)-4:]
+
+	// make a new connection or use the connection assigned to conn
+	if !found { // if an open connection does not exist with the user, create one
+		cert, err := tls.LoadX509KeyPair("my.crt", "my.key")
+		if err != nil {
+			return fmt.Errorf("failed to load server certificate and key: %v", err)
+		}
+
+		config := &tls.Config{
+			Certificates:          []tls.Certificate{cert},
+			RootCAs:               load_contacts(),
+			VerifyPeerCertificate: verify_peer_cert,
+			InsecureSkipVerify:    true,
+		}
+
+		destination := ip.String() + ":6969"
+
+		conn, err = tls.Dial("tcp", destination, config)
+		if err != nil {
+			return fmt.Errorf("connection failed: %v", err)
+		}
+
+		err = conn.Handshake()
+		if err != nil {
+			return fmt.Errorf("tls handshake failed: %v", err)
+		}
+
+		// handle incoming and outgoing messages
+
+		// go routine to read incoming messages
+		inboxMutex = new(sync.Mutex)
+		go func(file *os.File, inboxMutex *sync.Mutex, username string, conn *tls.Conn) {
+			for {
+				buffer := make([]byte, 1024)
+
+				n, err := conn.Read(buffer)
+				if err != nil {
+					fmt.Printf("Error while reading from connection: %v\n", err)
+					break
+				}
+
+				err = write_to_inbox(file, username, string(buffer[:n]), inboxMutex)
+				if err != nil {
+					fmt.Printf("Error while writing inbound message to inbox: %v\n", err)
+				}
+
+				fmt.Printf("%s: %s\n", username, string(buffer[:n]))
+			}
+		}(file, inboxMutex, username, conn)
+
+		// take input to write to the connection
+		var input string
+		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+		for {
+			fmt.Print("sm> ")
+			fmt.Scanln(&input)
+
+			if strings.ToLower(input) != "$quit" {
+				_, err := conn.Write([]byte(input))
+				if err != nil {
+					fmt.Printf("error writing to connection: %v\n", err)
+					continue
+				}
+
+				err = write_to_inbox(file, username, input, inboxMutex)
+				if err != nil {
+					fmt.Printf("Error while writing outbound message to inbox: %v\n", err)
+				}
+
+				fmt.Printf("Me: %s\n", input)
+			} else {
+				conn.Close()
+				break
+			}
+		}
+
+	} else { // the connection already existed, so just handle outgoing messages
+		// take input to write to the connection
+		var input string
+		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+		for {
+			fmt.Print("sm> ")
+			fmt.Scanln(&input)
+
+			if strings.ToLower(input) != "$quit" {
+				_, err := conn.Write([]byte(input))
+				if err != nil {
+					return fmt.Errorf("error writing to connection: %v", err)
+				}
+
+				write_to_inbox(file, username, input, inboxMutex)
+
+				fmt.Printf("Me: %s\n", input)
+			} else {
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+func verify_peer_cert(raw [][]byte, verifiedChains [][]*x509.Certificate) error {
+	// check if certificates were provided
+	if raw == nil {
+		return fmt.Errorf("verification failed: no certificates provided")
+	}
+
+	certBytesPro := raw[0]
+
+	// decode the block
+	block1, _ := pem.Decode(certBytesPro)
+	if block1 != nil {
+		return fmt.Errorf("verification failed: unable to decode certificate")
+	}
+
+	cert1, err := x509.ParseCertificate(certBytesPro)
+	if err != nil {
+		return fmt.Errorf("verification failed: unable to parse certificate: %v", err)
+	}
+
+	// extract the id and host from the certificate
+	id := cert1.DNSNames[0]
+
+	host := cert1.Subject.CommonName
+
+	fmt.Printf("verifying peer certificate: \ncertificate id: %s\ncertificate host: %s\n", id, host)
+
+	// look for matches of the id in the hostids file
+	found, pair, err := check_contact(id)
+	if err != nil {
+		return fmt.Errorf("verification failed: error while checking hostid file: %v", err)
+	}
+
+	if found { // the id was found within our contacts
+
+		if pair.Hostname != host { // the host in the certificate did not match the host in our contacts
+			return fmt.Errorf("verification failed: the claimed id on the certificate belonged to a host not matching the certificate host")
+		}
+
+		// retrieve the matching certificate in the contacts file and check for equality
+		files, err := os.ReadDir("contacts")
+		if err != nil {
+			log.Fatalf("Failed to read contacts directory: %v", err)
+		}
+
+		for _, file := range files {
+			if id == file.Name()[:len(file.Name())-4] {
+
+				// read the certificate to compare from the file
+				certBytes, err := os.ReadFile(filepath.Join("contacts", file.Name()))
+				if err != nil {
+					return fmt.Errorf("verification failed: failed to read certificate from matching file %s: %v", file.Name(), err)
+				}
+
+				block2, _ := pem.Decode(certBytes)
+				if block2 == nil {
+					return fmt.Errorf("verification failed: failed to decode the retrieved certificate")
+				}
+				cert2, err := x509.ParseCertificate(block2.Bytes)
+				if err != nil {
+					return fmt.Errorf("verification failed: failed to parse the retrieved certificate: %v", err)
+				}
+
+				if !reflect.DeepEqual(cert1.PublicKey, cert2.PublicKey) {
+					return fmt.Errorf("verification failed: the certificate corresponding to the id was not equal to the provided certificate")
+				}
+			}
+		}
+	} else {
+		return fmt.Errorf("verification failed: the id was not found in hostids")
+	}
+
+	return nil
+}
+
+func write_to_inbox(file *os.File, username string, message string, inboxMutex *sync.Mutex) error {
+	inboxMutex.Lock()
+	defer inboxMutex.Unlock()
+
+	_, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("error seeking to end of file: %v", err)
+	}
+
+	if _, err := file.Write([]byte(username + ": " + message + "\n")); err != nil {
+		return fmt.Errorf("failed to write the message to the file")
+	}
+	return nil
+}
+
+func check_contact(checkID string) (bool, HostID, error) {
+	var match HostID
+	found := false
+
+	file, err := os.Open("hostids.txt")
+	if err != nil {
+		return false, match, fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	fmt.Printf("Checking the contact file\n")
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		parts := strings.Fields(line)
+		hostname := parts[0]
+		id := parts[1]
+
+		// Process the hostname and ID pair
+		fmt.Printf("Hostname: %s, ID: %s\n", hostname, id)
+		if checkID == id {
+			fmt.Printf("Match found\n")
+			match.Hostname = hostname
+			match.ID = id
+			found = true
+			break
+		}
+	}
+
+	// Check for errors during scanning
+	if err := scanner.Err(); err != nil {
+		return false, match, fmt.Errorf("error scanning file: %v", err)
+	}
+
+	if found {
+		return true, match, nil
+	} else {
+		return false, match, nil
+	}
+}
+
+func add_new_contact(block *pem.Block) (HostID, error) {
+	// create HostID to hold the passed certificates contact
+	var pair HostID
+
+	// parse the certiicate
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return pair, fmt.Errorf("failed to parse certificate: %v", err)
+	}
+
+	// extract the host name from the certificate
+	hostName := cert.Subject.CommonName
+
+	// extract the id from the certificate
+	id := cert.DNSNames[0]
+
+	fmt.Printf("You have added user with id %s\n", id)
+
+	// lock the host id file
+	addHostIdMutex.Lock()
+
+	pair = HostID{Hostname: hostName, ID: id}
+
+	// write the HostID pair to the hostids file
+	file, err := os.Create("hostids.txt")
+	if err != nil {
+		return pair, fmt.Errorf("error opening hostids file: %v", err)
+	}
+
+	_, err = file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return pair, fmt.Errorf("error seeking end of hostids file: %v", err)
+	}
+
+	if _, err = file.Write([]byte(hostName + " " + id)); err != nil {
+		return pair, fmt.Errorf("error writing contact to file: %v", err)
+	}
+
+	// unlock the host id file
+	addHostIdMutex.Unlock()
+
+	// create inbox entry
+	inboxPath := filepath.Join("inbox", id+".txt")
+
+	_, err = os.Create(inboxPath)
+	if err != nil {
+		return pair, fmt.Errorf("failed to create inbox file")
+	}
+
+	// write the contact to the certificate directory
+	contactPath := filepath.Join("contacts", id+".crt")
+
+	err = os.WriteFile(contactPath, pem.EncodeToMemory(block), 0644)
+	if err != nil {
+		return pair, fmt.Errorf("failed to add new contact to contacts: %v", err)
+	}
+
+	// add the certificate to the pool
+
+	// lock ClientCAs until end of function
+	addCertMutex.Lock()
+	defer addCertMutex.Unlock()
+
+	if tlsConfig.ClientCAs == nil {
+		tlsConfig.ClientCAs = x509.NewCertPool()
+	}
+
+	if !tlsConfig.ClientCAs.AppendCertsFromPEM(pem.EncodeToMemory(block)) {
+		return pair, fmt.Errorf("failed to add new contact to certificate pool. reload the app and try again")
+	}
+
+	return pair, nil
+}
+
+func load_contacts() *x509.CertPool {
+	// create certificate directory name and certificate pool
+	certDir := "contacts"
+	caCertPool := x509.NewCertPool()
+
+	// check if the directory already exists
+	if _, err := os.Stat(certDir); err != nil {
+		if os.IsNotExist(err) {
+			err := os.MkdirAll(certDir, 0755)
+			if err != nil {
+				fmt.Printf("Error creating directory: %v\n", err)
+				return nil
+			}
+		} else {
+			fmt.Printf("Error finding/creating contact directory: %v", err)
+		}
+	}
+
+	// read files from the contacts directory and append them to the file
+	files, err := os.ReadDir(certDir)
+	if err != nil {
+		log.Fatalf("Failed to read contacts directory: %v", err)
+	}
+
+	for _, file := range files {
+
+		// read each certificate from the file
+		certData, err := os.ReadFile(filepath.Join(certDir, file.Name()))
+		if err != nil {
+			fmt.Printf("Failed to read certificate from file %s: %v", file.Name(), err)
+		}
+
+		// decode the certificate
+		block, _ := pem.Decode(certData)
+		if block == nil {
+			fmt.Printf("Failed to decode the certificate within the file %s: %v", file.Name(), err)
+		}
+
+		// append the certificate to the pool
+		if !caCertPool.AppendCertsFromPEM(pem.EncodeToMemory(block)) {
+			log.Fatalf("Failed to load contact to pool: %v", err)
+		}
+	}
+	return caCertPool
+}
+
+func get_id() (string, error) {
+	// read the unique id
+	file, err := os.Open("id.txt")
+	if err != nil {
+		return "nil", fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	var id string
+	for scanner.Scan() {
+		_, err := fmt.Sscanf(scanner.Text(), "%s", &id)
+		if err != nil {
+			return "nil", fmt.Errorf("error reading id: %v", err)
+		}
+		break
+	}
+
+	return id, nil
+
+}
+
+func generate_identifier() error {
+	file, err := os.Create("id.txt")
+	if err != nil {
+		return fmt.Errorf("error creating file: %v", err)
+	}
+	defer file.Close()
+
+	random := rand.Intn(999000)
+	random = random + 1000
+
+	_, err = fmt.Fprintf(file, "%d", random)
+	if err != nil {
+		return fmt.Errorf("error writing user id to file: %v", err)
+	}
+
+	return nil
+}
+
+// generate the self signed certificate
+func generate_self_signed() error {
+	name, _ := os.Hostname()
+
+	// get id
+	id, err := get_id()
+	if err != nil {
+		return fmt.Errorf("failed to get the id: %v", err)
+	}
+
+	config := selfca.Certificate{
+		IsCA:       true,
+		CommonName: name,
+		Hosts:      []string{id},
+		NotBefore:  time.Now(),
+		NotAfter:   time.Now().Add(time.Duration(365*24) * time.Hour),
+	}
+
+	certificate, key, err := selfca.GenerateCertificate(config)
+	if err != nil {
+		return fmt.Errorf("the certificate failed to generate: %v", err)
+	}
+
+	err = selfca.WriteCertificate("my", certificate, key)
+	if err != nil {
+		return fmt.Errorf("failed to write the certificate: %v", err)
+	}
+
+	return nil
 }
 
 // handle input on the main menu and allow the user to
@@ -244,6 +937,112 @@ func handle_main_menu(input string) string {
 
 func main() {
 	// login
+
+	// generate unique identifier if not exists
+	_, err := os.Stat("id.txt")
+	if os.IsNotExist(err) {
+		err = generate_identifier()
+		if err != nil {
+			log.Fatalf("failed to generate identifier: %v\n", err)
+		}
+	}
+
+	// generate hostids.txt file
+	if _, err := os.Stat("hostids.txt"); os.IsNotExist(err) {
+		_, err := os.Create("hostids.txt")
+		if err != nil {
+			log.Fatalf("failed to create hostids file: %v\n", err)
+		}
+	}
+
+	// generate contacts directory
+	if _, err := os.Stat("contacts"); os.IsNotExist(err) {
+		err := os.Mkdir("contacts", 0755)
+		if err != nil {
+			log.Fatalf("failed to create contacts directory: %v", err)
+		}
+	}
+
+	// generate inbox directory
+	if _, err := os.Stat("inbox"); os.IsNotExist(err) {
+		err := os.Mkdir("inbox", 0755)
+		if err != nil {
+			log.Fatalf("failed to create inbox directory: %v", err)
+		}
+	}
+
+	// setup http server for tls
+
+	// initialize the tls connection store
+	store = NewTLSConnectionStore()
+
+	// generate self signed certificate if not already done
+	_, err1 := os.Stat("my.crt")
+	_, err2 := os.Stat("my.key")
+	if err1 == nil && err2 == nil {
+
+	} else if os.IsNotExist(err1) || os.IsNotExist(err2) {
+		err = generate_self_signed()
+		if err != nil {
+			fmt.Printf("Failed to generate certificate: %v\n", err)
+		}
+	} else {
+		fmt.Printf("Error checking for certificate existence\n")
+	}
+
+	cert, err := tls.LoadX509KeyPair("my.crt", "my.key")
+	if err != nil {
+		log.Fatalf("Failed to load server certificate and key: %v", err)
+	}
+
+	// name the handler function for incoming connections
+	handler := http.HandlerFunc(tls_connection_handler)
+
+	// configure the tls setup
+	tlsConfig = &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		MinVersion:            tls.VersionTLS12,
+		MaxVersion:            tls.VersionTLS13,
+		ClientCAs:             load_contacts(),
+		ClientAuth:            tls.RequireAnyClientCert,
+		VerifyPeerCertificate: verify_peer_cert,
+	}
+
+	// create the tls server
+	tlsServer := &http.Server{
+		Addr:      ":6969",
+		Handler:   handler,
+		TLSConfig: tlsConfig,
+	}
+
+	// start the go routine for the tls server
+	go func() {
+		if err := tlsServer.ListenAndServeTLS("my.crt", "my.key"); err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// start tcp connection for certificate exchange
+
+	go func() {
+		tcpListener, err := net.Listen("tcp", ":7777")
+		if err != nil {
+			fmt.Printf("TCP server error: %v\n", err)
+			return
+		}
+		defer tcpListener.Close()
+
+		for {
+			conn, err := tcpListener.Accept()
+			if err != nil {
+				fmt.Printf("TCP connection error: %v\n", err)
+				continue
+			}
+
+			// Handle TCP connection in a separate goroutine
+			go tcp_connection_handler(conn)
+		}
+	}()
 
 	// Announce presence on the network for duration of time with program open
 	server := announce_presence()
