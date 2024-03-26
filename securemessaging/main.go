@@ -10,7 +10,6 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -42,6 +41,7 @@ type TLSConnectionStore struct {
 type ConnectionInfo struct {
 	cert       *x509.Certificate
 	conn       *tls.Conn
+	active     bool
 	InboxMutex sync.Mutex
 }
 
@@ -69,12 +69,6 @@ func (s *TLSConnectionStore) Remove(id string) {
 // declare the store as global variable
 var (
 	store *TLSConnectionStore
-)
-
-// to dynamically add certificates to the pool
-var (
-	tlsConfig    *tls.Config
-	addCertMutex sync.Mutex
 )
 
 // to add hostids to the hostids file
@@ -134,7 +128,7 @@ func peer_discovery() []*mdns.ServiceEntry {
 		}
 	}()
 
-	fmt.Printf("Users to connect with: \n")
+	fmt.Printf("\nUsers to connect with: \n")
 	mdns.Query(params)
 
 	time.Sleep(5 * time.Second)
@@ -237,7 +231,7 @@ func setup_chat_with(selection chatRequest) (HostID, error) {
 		return dstHostID, fmt.Errorf("could not create connection: %v", err)
 	}
 
-	fmt.Printf("The connection was successful\n")
+	//fmt.Printf("The connection was successful\n")
 
 	// get own id to send over connection
 	myId, _ := get_id()
@@ -245,7 +239,7 @@ func setup_chat_with(selection chatRequest) (HostID, error) {
 	// write own id to connection
 	conn.Write([]byte(myId))
 
-	fmt.Printf("Successfully wrote id to connection\n")
+	//fmt.Printf("Successfully wrote id to connection\n")
 
 	// read from connection
 	buffer := make([]byte, 2048)
@@ -328,7 +322,7 @@ func tcp_connection_handler(conn net.Conn) {
 		return
 	}
 
-	fmt.Printf("receieved request from id %s\n", yourId)
+	//fmt.Printf("receieved request from id %s\n", yourId)
 
 	// check whether the user is in your contacts
 	found, _, err := check_contact(yourId)
@@ -392,10 +386,17 @@ func tcp_connection_handler(conn net.Conn) {
 }
 
 // Handle incoming connections from other users
-func tls_connection_handler(w http.ResponseWriter, r *http.Request) {
+func tls_connection_handler(conn *tls.Conn) {
+
+	// get the connection state
+	state := conn.ConnectionState()
+
+	if len(state.PeerCertificates) == 0 {
+		fmt.Printf("no peer certificate\n")
+	}
 
 	// get the client certificate
-	clientCert := r.TLS.PeerCertificates[0]
+	clientCert := state.PeerCertificates[0]
 
 	// extract the host name from the certificate
 	hostName := clientCert.Subject.CommonName
@@ -410,29 +411,18 @@ func tls_connection_handler(w http.ResponseWriter, r *http.Request) {
 	inboxPath := filepath.Join("inbox", id+".txt")
 	file, err := os.Create(inboxPath)
 	if err != nil {
-		log.Printf("failed to open the inbox file: %v", err)
+		fmt.Printf("failed to open the inbox file: %v", err)
 	}
-
-	// hijack the underlying connection
-	underlyingConn, _, _ := w.(http.Hijacker).Hijack()
-	conn, ok := underlyingConn.(*tls.Conn)
-	if !ok {
-		underlyingConn.Close()
-		return
-	}
-
-	fmt.Printf("Hijacked underlying connection")
 
 	// create connection to add to the store
 	connection := ConnectionInfo{
-		cert: clientCert,
-		conn: conn,
+		cert:   clientCert,
+		conn:   conn,
+		active: false,
 	}
 
 	// add connection to the store
 	store.Add(id, &connection)
-
-	fmt.Printf("Added connection to store")
 
 	// persistently read messages from the connection and write them to the inbox
 	for {
@@ -443,7 +433,14 @@ func tls_connection_handler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		write_to_inbox(file, username, string(buffer[:n]), &connection.InboxMutex)
+		if connection.active {
+			fmt.Printf("\n%s: %s\nMe: ", username, string(buffer[:n]))
+		}
+
+		err = write_to_inbox(file, username, string(buffer[:n]), &connection.InboxMutex)
+		if err != nil {
+			fmt.Printf("error while writing the incoming message to inbox: %v", err)
+		}
 	}
 
 	store.Remove(id)
@@ -460,12 +457,15 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 	// inboxMutex mutex lock
 	var inboxMutex *sync.Mutex
 
+	// active bool
+	var active *bool
+
 	// check whether a connection already exists with the user
 	store.TLStoreMutex.Lock()
 	for idKey := range store.connections {
 		if idKey == userID.ID { // there is already an existing connection with the user, being handled by a tls_connection_handler routine
 
-			fmt.Print("An open connection with the user was found, getting details from store")
+			fmt.Print("An open connection with the user was found, getting details from store\n")
 
 			conn = store.connections[idKey].conn
 
@@ -478,6 +478,11 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 			// get the inboxMutex
 			inboxMutex = &store.connections[idKey].InboxMutex // assign the mutex lock associated to this connections inbox to the initalized variable
 			found = true                                      // the connection was found within the store
+
+			// set the active bool to true so the tls connection handler prints the messages
+			active = &store.connections[idKey].active
+			*active = true
+
 			break
 		}
 	}
@@ -502,7 +507,6 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 		config := &tls.Config{
 			Certificates:          []tls.Certificate{cert},
-			RootCAs:               load_contacts(),
 			VerifyPeerCertificate: verify_peer_cert,
 			InsecureSkipVerify:    true,
 		}
@@ -519,35 +523,57 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 			return fmt.Errorf("tls handshake failed: %v", err)
 		}
 
+		fmt.Printf("the tls connection was successful\n")
+
 		// handle incoming and outgoing messages
 
 		// go routine to read incoming messages
+
+		// make mutex to synchronize incoming vs outgoing messages
 		inboxMutex = new(sync.Mutex)
+
 		go func(file *os.File, inboxMutex *sync.Mutex, username string, conn *tls.Conn) {
 			for {
 				buffer := make([]byte, 1024)
 
 				n, err := conn.Read(buffer)
 				if err != nil {
-					fmt.Printf("Error while reading from connection: %v\n", err)
+					if err == io.EOF {
+						fmt.Printf("The user has closed the connection. You may now initiate a new connection.\n")
+					} else {
+						fmt.Printf("Error while reading from connection: %v\n", err)
+					}
 					break
 				}
 
-				err = write_to_inbox(file, username, string(buffer[:n]), inboxMutex)
+				err = write_to_inbox(file, "Me", string(buffer[:n]), inboxMutex)
 				if err != nil {
 					fmt.Printf("Error while writing inbound message to inbox: %v\n", err)
 				}
 
-				fmt.Printf("%s: %s\n", username, string(buffer[:n]))
+				fmt.Printf("\n%s: %s\nMe: ", username, string(buffer[:n]))
 			}
 		}(file, inboxMutex, username, conn)
 
+		// go routine for writing to connection
+
 		// take input to write to the connection
 		var input string
+		// reader to take input
+		scan := bufio.NewReader(os.Stdin)
+
 		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+
 		for {
-			fmt.Print("sm> ")
-			fmt.Scanln(&input)
+			fmt.Print("Me: ")
+
+			// scan the input and trim newlines/whitespace
+			input, err = scan.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading input: %v\n", err)
+			}
+
+			input = strings.TrimSpace(input)
 
 			if strings.ToLower(input) != "$quit" {
 				_, err := conn.Write([]byte(input))
@@ -561,7 +587,6 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 					fmt.Printf("Error while writing outbound message to inbox: %v\n", err)
 				}
 
-				fmt.Printf("Me: %s\n", input)
 			} else {
 				conn.Close()
 				break
@@ -572,9 +597,19 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 		// take input to write to the connection
 		var input string
 		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+
+		scan := bufio.NewReader(os.Stdin)
+
 		for {
-			fmt.Print("sm> ")
-			fmt.Scanln(&input)
+			fmt.Print("Me: ")
+
+			// scan the input and trim newlines/whitespace
+			input, err = scan.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading input: %v\n", err)
+			}
+
+			input = strings.TrimSpace(input)
 
 			if strings.ToLower(input) != "$quit" {
 				_, err := conn.Write([]byte(input))
@@ -584,8 +619,9 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 				write_to_inbox(file, username, input, inboxMutex)
 
-				fmt.Printf("Me: %s\n", input)
 			} else {
+				// set the active bool back to false so the tls connection handler stops printing messages
+				*active = false
 				break
 			}
 		}
@@ -595,6 +631,7 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 }
 
 func verify_peer_cert(raw [][]byte, verifiedChains [][]*x509.Certificate) error {
+
 	// check if certificates were provided
 	if raw == nil {
 		return fmt.Errorf("verification failed: no certificates provided")
@@ -618,7 +655,7 @@ func verify_peer_cert(raw [][]byte, verifiedChains [][]*x509.Certificate) error 
 
 	host := cert1.Subject.CommonName
 
-	fmt.Printf("verifying peer certificate: \ncertificate id: %s\ncertificate host: %s\n", id, host)
+	//fmt.Printf("verifying peer certificate: \ncertificate id: %s\ncertificate host: %s\n", id, host)
 
 	// look for matches of the id in the hostids file
 	found, pair, err := check_contact(id)
@@ -695,7 +732,7 @@ func check_contact(checkID string) (bool, HostID, error) {
 
 	scanner := bufio.NewScanner(file)
 
-	fmt.Printf("Checking the contact file\n")
+	//fmt.Printf("Checking the contact file\n")
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -704,9 +741,9 @@ func check_contact(checkID string) (bool, HostID, error) {
 		id := parts[1]
 
 		// Process the hostname and ID pair
-		fmt.Printf("Hostname: %s, ID: %s\n", hostname, id)
+		//fmt.Printf("Hostname: %s, ID: %s\n", hostname, id)
 		if checkID == id {
-			fmt.Printf("Match found\n")
+			//fmt.Printf("Match found\n")
 			match.Hostname = hostname
 			match.ID = id
 			found = true
@@ -742,7 +779,7 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	// extract the id from the certificate
 	id := cert.DNSNames[0]
 
-	fmt.Printf("You have added user with id %s\n", id)
+	//fmt.Printf("You have added user with id %s\n", id)
 
 	// lock the host id file
 	addHostIdMutex.Lock()
@@ -783,67 +820,7 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 		return pair, fmt.Errorf("failed to add new contact to contacts: %v", err)
 	}
 
-	// add the certificate to the pool
-
-	// lock ClientCAs until end of function
-	addCertMutex.Lock()
-	defer addCertMutex.Unlock()
-
-	if tlsConfig.ClientCAs == nil {
-		tlsConfig.ClientCAs = x509.NewCertPool()
-	}
-
-	if !tlsConfig.ClientCAs.AppendCertsFromPEM(pem.EncodeToMemory(block)) {
-		return pair, fmt.Errorf("failed to add new contact to certificate pool. reload the app and try again")
-	}
-
 	return pair, nil
-}
-
-func load_contacts() *x509.CertPool {
-	// create certificate directory name and certificate pool
-	certDir := "contacts"
-	caCertPool := x509.NewCertPool()
-
-	// check if the directory already exists
-	if _, err := os.Stat(certDir); err != nil {
-		if os.IsNotExist(err) {
-			err := os.MkdirAll(certDir, 0755)
-			if err != nil {
-				fmt.Printf("Error creating directory: %v\n", err)
-				return nil
-			}
-		} else {
-			fmt.Printf("Error finding/creating contact directory: %v", err)
-		}
-	}
-
-	// read files from the contacts directory and append them to the file
-	files, err := os.ReadDir(certDir)
-	if err != nil {
-		log.Fatalf("Failed to read contacts directory: %v", err)
-	}
-
-	for _, file := range files {
-
-		// read each certificate from the file
-		certData, err := os.ReadFile(filepath.Join(certDir, file.Name()))
-		if err != nil {
-			fmt.Printf("Failed to read certificate from file %s: %v", file.Name(), err)
-		}
-
-		// decode the certificate
-		block, _ := pem.Decode(certData)
-		if block == nil {
-			fmt.Printf("Failed to decode the certificate within the file %s: %v", file.Name(), err)
-		}
-
-		// append the certificate to the pool
-		if !caCertPool.AppendCertsFromPEM(pem.EncodeToMemory(block)) {
-			log.Fatalf("Failed to load contact to pool: %v", err)
-		}
-	}
-	return caCertPool
 }
 
 func get_id() (string, error) {
@@ -995,39 +972,52 @@ func main() {
 		log.Fatalf("Failed to load server certificate and key: %v", err)
 	}
 
-	// name the handler function for incoming connections
-	handler := http.HandlerFunc(tls_connection_handler)
-
 	// configure the tls setup
-	tlsConfig = &tls.Config{
+	tlsConfig := &tls.Config{
 		Certificates:          []tls.Certificate{cert},
 		MinVersion:            tls.VersionTLS12,
 		MaxVersion:            tls.VersionTLS13,
-		ClientCAs:             load_contacts(),
 		ClientAuth:            tls.RequireAnyClientCert,
 		VerifyPeerCertificate: verify_peer_cert,
 	}
 
-	// create the tls server
-	tlsServer := &http.Server{
-		Addr:      ":6969",
-		Handler:   handler,
-		TLSConfig: tlsConfig,
-	}
-
 	// start the go routine for the tls server
 	go func() {
-		if err := tlsServer.ListenAndServeTLS("my.crt", "my.key"); err != nil {
-			log.Fatalf("Failed to start server: %v", err)
+		server, err := tls.Listen("tcp", ":6969", tlsConfig)
+		if err != nil {
+			log.Fatalf("tls server error: %v", err)
+		}
+		defer server.Close()
+
+		for {
+			conn, err := server.Accept()
+			if err != nil {
+				fmt.Printf("error accepting tls connection: %v", err)
+				continue
+			}
+
+			tlsConn, ok := conn.(*tls.Conn)
+			if !ok {
+				fmt.Printf("error casting the net connection\n")
+				continue
+			}
+
+			err = tlsConn.Handshake()
+			if err != nil {
+				fmt.Printf("tls handshake failed: %v", err)
+				continue
+			}
+
+			go tls_connection_handler(tlsConn)
 		}
 	}()
 
-	// start tcp connection for certificate exchange
+	// start tcp server for certificate exchange
 
 	go func() {
 		tcpListener, err := net.Listen("tcp", ":7777")
 		if err != nil {
-			fmt.Printf("TCP server error: %v\n", err)
+			log.Fatalf("tcp server error: %v\n", err)
 			return
 		}
 		defer tcpListener.Close()
