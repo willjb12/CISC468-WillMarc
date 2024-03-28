@@ -121,7 +121,6 @@ func peer_discovery() []*mdns.ServiceEntry {
 
 	go func() {
 		for entry := range entriesCh {
-			// fmt.Printf("sm> Got new entry: %v\n", entry)
 			mu.Lock()
 			discovered = append(discovered, entry)
 			mu.Unlock()
@@ -391,10 +390,6 @@ func tls_connection_handler(conn *tls.Conn) {
 	// get the connection state
 	state := conn.ConnectionState()
 
-	if len(state.PeerCertificates) == 0 {
-		fmt.Printf("no peer certificate\n")
-	}
-
 	// get the client certificate
 	clientCert := state.PeerCertificates[0]
 
@@ -408,7 +403,7 @@ func tls_connection_handler(conn *tls.Conn) {
 	username := hostName + "#" + id[len(id)-4:]
 
 	// open the correct inbox file
-	inboxPath := filepath.Join("inbox", id+".txt")
+	inboxPath := filepath.Join("inbox", id, id+".txt")
 	file, err := os.Create(inboxPath)
 	if err != nil {
 		fmt.Printf("failed to open the inbox file: %v", err)
@@ -434,7 +429,7 @@ func tls_connection_handler(conn *tls.Conn) {
 		}
 
 		if connection.active {
-			fmt.Printf("\n%s: %s\nMe: ", username, string(buffer[:n]))
+			fmt.Printf("\n%s: %s\n", username, string(buffer[:n]))
 		}
 
 		err = write_to_inbox(file, username, string(buffer[:n]), &connection.InboxMutex)
@@ -457,7 +452,8 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 	// inboxMutex mutex lock
 	var inboxMutex *sync.Mutex
 
-	// active bool
+	// initialize active to tell the tls connection handler whether it should be printing the messages
+	// this is only relevant if the connection had already been established
 	var active *bool
 
 	// check whether a connection already exists with the user
@@ -489,7 +485,7 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 	store.TLStoreMutex.Unlock() // unlock the store mutex
 
 	// open the correct inbox file
-	inboxPath := filepath.Join("inbox", userID.ID+".txt")
+	inboxPath := filepath.Join("inbox", userID.ID, userID.ID+".txt")
 	file, err := os.Create(inboxPath)
 	if err != nil {
 		return fmt.Errorf("failed to open the inbox file: %v", err)
@@ -538,11 +534,8 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 				n, err := conn.Read(buffer)
 				if err != nil {
-					if err == io.EOF {
-						fmt.Printf("The user has closed the connection. You may now initiate a new connection.\n")
-					} else {
-						fmt.Printf("Error while reading from connection: %v\n", err)
-					}
+					// this error mean that we closed the connection
+					//fmt.Printf("Error while reading from connection: %v\n", err)
 					break
 				}
 
@@ -551,7 +544,7 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 					fmt.Printf("Error while writing inbound message to inbox: %v\n", err)
 				}
 
-				fmt.Printf("\n%s: %s\nMe: ", username, string(buffer[:n]))
+				fmt.Printf("\n%s: %s\n\n", username, string(buffer[:n]))
 			}
 		}(file, inboxMutex, username, conn)
 
@@ -559,14 +552,13 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 		// take input to write to the connection
 		var input string
+
 		// reader to take input
 		scan := bufio.NewReader(os.Stdin)
 
 		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
 
 		for {
-			fmt.Print("Me: ")
-
 			// scan the input and trim newlines/whitespace
 			input, err = scan.ReadString('\n')
 			if err != nil {
@@ -601,8 +593,6 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 		scan := bufio.NewReader(os.Stdin)
 
 		for {
-			fmt.Print("Me: ")
-
 			// scan the input and trim newlines/whitespace
 			input, err = scan.ReadString('\n')
 			if err != nil {
@@ -614,7 +604,8 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 			if strings.ToLower(input) != "$quit" {
 				_, err := conn.Write([]byte(input))
 				if err != nil {
-					return fmt.Errorf("error writing to connection: %v", err)
+					fmt.Printf("\nChat ended\n\nReturning to selection\n\n")
+					return nil
 				}
 
 				write_to_inbox(file, username, input, inboxMutex)
@@ -804,8 +795,16 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	// unlock the host id file
 	addHostIdMutex.Unlock()
 
+	// create the users inbox directory
+	makeDirPath := filepath.Join("inbox", id)
+
+	err = os.MkdirAll(makeDirPath, 0755)
+	if err != nil {
+		return pair, fmt.Errorf("error creating users inbox directory: %v", err)
+	}
+
 	// create inbox entry
-	inboxPath := filepath.Join("inbox", id+".txt")
+	inboxPath := filepath.Join("inbox", id, id+".txt")
 
 	_, err = os.Create(inboxPath)
 	if err != nil {
@@ -912,8 +911,7 @@ func handle_main_menu(input string) string {
 	return "not good"
 }
 
-func main() {
-	// login
+func app_startup_checks() {
 
 	// generate unique identifier if not exists
 	_, err := os.Stat("id.txt")
@@ -948,18 +946,13 @@ func main() {
 		}
 	}
 
-	// setup http server for tls
-
-	// initialize the tls connection store
-	store = NewTLSConnectionStore()
-
 	// generate self signed certificate if not already done
 	_, err1 := os.Stat("my.crt")
 	_, err2 := os.Stat("my.key")
 	if err1 == nil && err2 == nil {
 
 	} else if os.IsNotExist(err1) || os.IsNotExist(err2) {
-		err = generate_self_signed()
+		err := generate_self_signed()
 		if err != nil {
 			fmt.Printf("Failed to generate certificate: %v\n", err)
 		}
@@ -967,6 +960,28 @@ func main() {
 		fmt.Printf("Error checking for certificate existence\n")
 	}
 
+	// generate key migration directory
+	if _, err := os.Stat("toupdate"); os.IsNotExist(err) {
+		err := os.Mkdir("toupdate", 0755)
+		if err != nil {
+			fmt.Printf("Failed to create the key migration directory: %v\n", err)
+		}
+	}
+
+}
+
+func main() {
+	// login
+
+	// startup checks
+	app_startup_checks()
+
+	// setup http server for tls
+
+	// initialize the tls connection store
+	store = NewTLSConnectionStore()
+
+	// load key pair
 	cert, err := tls.LoadX509KeyPair("my.crt", "my.key")
 	if err != nil {
 		log.Fatalf("Failed to load server certificate and key: %v", err)
