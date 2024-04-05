@@ -2,20 +2,30 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/crypto/pbkdf2"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/hashicorp/mdns"
 	"github.com/likexian/selfca"
@@ -76,6 +86,11 @@ var (
 	addHostIdMutex sync.Mutex
 )
 
+// store the password derived key in memory so we can encrypt at the end
+var (
+	PDKey []byte
+)
+
 func print_nice_columns(discovered []*mdns.ServiceEntry) {
 	var userNum string
 	var userName string
@@ -99,8 +114,8 @@ func print_nice_columns(discovered []*mdns.ServiceEntry) {
 
 func announce_presence() *mdns.Server {
 	host, _ := os.Hostname()
-	info := []string{"Secure Messaging"}
-	service, _ := mdns.NewMDNSService(host, "_securemessaging._udp", "", "", 8000, nil, info)
+	id, _ := get_id()
+	service, _ := mdns.NewMDNSService(host, "_securemessaging._udp", "", "", 8000, nil, []string{id})
 
 	// Create the mDNS server, defer shutdown
 	server, _ := mdns.NewServer(&mdns.Config{Zone: service})
@@ -127,12 +142,9 @@ func peer_discovery() []*mdns.ServiceEntry {
 		}
 	}()
 
-	fmt.Printf("\nUsers to connect with: \n")
 	mdns.Query(params)
 
 	time.Sleep(5 * time.Second)
-
-	print_nice_columns(discovered)
 
 	return discovered
 }
@@ -150,6 +162,8 @@ func initiate_chat() {
 
 		for {
 			discovered := peer_discovery()
+
+			print_nice_columns(discovered)
 
 			fmt.Println("\nEnter the user you would like to connect to, refresh to refresh, or back")
 
@@ -404,7 +418,7 @@ func tls_connection_handler(conn *tls.Conn) {
 
 	// open the correct inbox file
 	inboxPath := filepath.Join("inbox", id, id+".txt")
-	file, err := os.Create(inboxPath)
+	file, err := os.OpenFile(inboxPath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Printf("failed to open the inbox file: %v", err)
 	}
@@ -426,6 +440,20 @@ func tls_connection_handler(conn *tls.Conn) {
 		n, err := conn.Read(buffer)
 		if err != nil {
 			break
+		}
+
+		if buffer[0] == 0x04 {
+			if connection.active {
+				fmt.Printf("\nThe connection was closed by the initiator\n")
+			}
+			break
+		}
+
+		if buffer[0] == 0x05 {
+			err = revoke_contact(id)
+			if err != nil {
+				fmt.Printf("error while trying to revoke contact: %v", err)
+			}
 		}
 
 		if connection.active {
@@ -486,7 +514,7 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 	// open the correct inbox file
 	inboxPath := filepath.Join("inbox", userID.ID, userID.ID+".txt")
-	file, err := os.Create(inboxPath)
+	file, err := os.OpenFile(inboxPath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open the inbox file: %v", err)
 	}
@@ -496,99 +524,120 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 
 	// make a new connection or use the connection assigned to conn
 	if !found { // if an open connection does not exist with the user, create one
+
+		// load the key pair
 		cert, err := tls.LoadX509KeyPair("my.crt", "my.key")
 		if err != nil {
 			return fmt.Errorf("failed to load server certificate and key: %v", err)
 		}
 
+		// create the tls connection config
 		config := &tls.Config{
 			Certificates:          []tls.Certificate{cert},
 			VerifyPeerCertificate: verify_peer_cert,
 			InsecureSkipVerify:    true,
 		}
 
+		// form the destination address
 		destination := ip.String() + ":6969"
 
+		// dial the connection
 		conn, err = tls.Dial("tcp", destination, config)
 		if err != nil {
 			return fmt.Errorf("connection failed: %v", err)
 		}
 
+		// perform the handshake
 		err = conn.Handshake()
 		if err != nil {
 			return fmt.Errorf("tls handshake failed: %v", err)
 		}
 
-		fmt.Printf("the tls connection was successful\n")
+		fmt.Printf("the connection was successful\n")
 
 		// handle incoming and outgoing messages
 
-		// go routine to read incoming messages
+		// chan to deal with connection closure
+		closureChan := make(chan bool)
 
-		// make mutex to synchronize incoming vs outgoing messages
+		// make mutex to synchronize writing incoming vs outgoing messages to inbox
 		inboxMutex = new(sync.Mutex)
 
+		// go routine to read incoming messages
 		go func(file *os.File, inboxMutex *sync.Mutex, username string, conn *tls.Conn) {
 			for {
 				buffer := make([]byte, 1024)
 
 				n, err := conn.Read(buffer)
 				if err != nil {
-					// this error mean that we closed the connection
-					//fmt.Printf("Error while reading from connection: %v\n", err)
+					closureChan <- true
 					break
 				}
 
-				err = write_to_inbox(file, "Me", string(buffer[:n]), inboxMutex)
+				err = write_to_inbox(file, username, string(buffer[:n]), inboxMutex)
 				if err != nil {
 					fmt.Printf("Error while writing inbound message to inbox: %v\n", err)
 				}
 
-				fmt.Printf("\n%s: %s\n\n", username, string(buffer[:n]))
+				fmt.Printf("\n%s: %s\n", username, string(buffer[:n]))
 			}
 		}(file, inboxMutex, username, conn)
 
 		// go routine for writing to connection
 
-		// take input to write to the connection
-		var input string
+		go func(file *os.File, inboxMutex *sync.Mutex, usename string, conn *tls.Conn) {
+			// take input to write to the connection
+			var input string
 
-		// reader to take input
-		scan := bufio.NewReader(os.Stdin)
+			// reader to take input
+			scan := bufio.NewReader(os.Stdin)
 
-		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+			fmt.Printf("You are now chatting with %s. Enter quit to quit.\n", username)
 
-		for {
-			// scan the input and trim newlines/whitespace
-			input, err = scan.ReadString('\n')
-			if err != nil {
-				fmt.Printf("Error reading input: %v\n", err)
-			}
-
-			input = strings.TrimSpace(input)
-
-			if strings.ToLower(input) != "$quit" {
-				_, err := conn.Write([]byte(input))
+			for {
+				// scan the input and trim newlines/whitespace
+				input, err = scan.ReadString('\n')
 				if err != nil {
-					fmt.Printf("error writing to connection: %v\n", err)
-					continue
+					if err != io.EOF {
+						fmt.Printf("Error reading input: %v\n", err)
+					} else {
+						fmt.Printf("\nConnection closed\n")
+						conn.Write([]byte{0x04})
+						closureChan <- true
+						break
+					}
 				}
 
-				err = write_to_inbox(file, username, input, inboxMutex)
-				if err != nil {
-					fmt.Printf("Error while writing outbound message to inbox: %v\n", err)
-				}
+				input = strings.TrimSpace(input)
 
-			} else {
-				conn.Close()
-				break
+				if input != "quit" { // if the input is not a quit signal send it into the connection
+					_, err := conn.Write([]byte(input))
+					if err != nil {
+						fmt.Printf("error writing to connection: %v\n", err)
+						continue
+					}
+
+					err = write_to_inbox(file, "Me", input, inboxMutex)
+					if err != nil {
+						fmt.Printf("Error while writing outbound message to inbox: %v\n", err)
+					}
+
+				} else { // otherwise send the closure signl and close the conneciton
+					conn.Write([]byte{0x04})
+					conn.Close()
+					closureChan <- true
+					break
+				}
 			}
-		}
+		}(file, inboxMutex, username, conn)
+
+		// block until closure signal received
+		<-closureChan
 
 	} else { // the connection already existed, so just handle outgoing messages
 		// take input to write to the connection
 		var input string
-		fmt.Printf("You are now chatting with %s. Enter $quit to quit.\n", username)
+		fmt.Printf("You are now chatting with %s. Enter quit to quit.\n", username)
 
 		scan := bufio.NewReader(os.Stdin)
 
@@ -596,19 +645,25 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 			// scan the input and trim newlines/whitespace
 			input, err = scan.ReadString('\n')
 			if err != nil {
+				if err == io.EOF {
+					fmt.Printf("Chat closed\n\n")
+				}
 				fmt.Printf("Error reading input: %v\n", err)
 			}
 
 			input = strings.TrimSpace(input)
 
-			if strings.ToLower(input) != "$quit" {
+			if input != "quit" {
 				_, err := conn.Write([]byte(input))
 				if err != nil {
-					fmt.Printf("\nChat ended\n\nReturning to selection\n\n")
+					fmt.Printf("\nChat closed\n\n")
 					return nil
 				}
 
-				write_to_inbox(file, username, input, inboxMutex)
+				err = write_to_inbox(file, "Me", input, inboxMutex)
+				if err != nil {
+					fmt.Printf("Error while writing outbound message to inbox: %v\n", err)
+				}
 
 			} else {
 				// set the active bool back to false so the tls connection handler stops printing messages
@@ -690,7 +745,7 @@ func verify_peer_cert(raw [][]byte, verifiedChains [][]*x509.Certificate) error 
 			}
 		}
 	} else {
-		return fmt.Errorf("verification failed: the id was not found in hostids")
+		return fmt.Errorf("verification failed: the id was not found: %v", err)
 	}
 
 	return nil
@@ -706,7 +761,7 @@ func write_to_inbox(file *os.File, username string, message string, inboxMutex *
 	}
 
 	if _, err := file.Write([]byte(username + ": " + message + "\n")); err != nil {
-		return fmt.Errorf("failed to write the message to the file")
+		return fmt.Errorf("failed to write the message to the file: %v", err)
 	}
 	return nil
 }
@@ -770,15 +825,45 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	// extract the id from the certificate
 	id := cert.DNSNames[0]
 
+	// make the pair
+	pair = HostID{Hostname: hostName, ID: id}
+
+	// check if an entry already exists for that id
+	// this could also mean that we have revoked our certificate
+	found, _, err := check_contact(id)
+	if err != nil {
+		return pair, fmt.Errorf("error checking hostids file while adding contact: %v", err)
+	}
+	if found {
+		// read the certificate to compare from the file
+		certBytes, err := os.ReadFile(filepath.Join("contacts", id+".crt"))
+		if err != nil {
+			return pair, fmt.Errorf("error while looking into repeated id: error reading certificate: %v", err)
+		}
+
+		block2, _ := pem.Decode(certBytes)
+		if block2 == nil {
+			return pair, fmt.Errorf("error reading cerificate from contacts")
+		}
+		contactCert, err := x509.ParseCertificate(block2.Bytes)
+		if err != nil {
+			return pair, fmt.Errorf("error parsing the certificate from contacts")
+		}
+
+		if !reflect.DeepEqual(cert.PublicKey, contactCert.PublicKey) {
+			return pair, fmt.Errorf("the certificate in contacts did not match the provided certificate: invalid repeated certificate detected: aborting setup: contact not added")
+		} else {
+			return pair, nil
+		}
+	}
+
 	//fmt.Printf("You have added user with id %s\n", id)
 
 	// lock the host id file
 	addHostIdMutex.Lock()
 
-	pair = HostID{Hostname: hostName, ID: id}
-
 	// write the HostID pair to the hostids file
-	file, err := os.Create("hostids.txt")
+	file, err := os.OpenFile("hostids.txt", os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return pair, fmt.Errorf("error opening hostids file: %v", err)
 	}
@@ -822,6 +907,267 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	return pair, nil
 }
 
+func revoke_contact(revokeid string) error {
+
+	// open the original file
+	hostidsFile, err := os.Open("hostids.txt")
+	if err != nil {
+		fmt.Printf("error while opening the hostids file: %v", err)
+	}
+
+	// create a new file
+	newHostidsFile, err := os.Create("temp.txt")
+	if err != nil {
+		fmt.Printf("error while creating the temp file: %v", err)
+	}
+
+	// consider each id and write all besides the one revoked to the temp file
+	idscanner := bufio.NewScanner(hostidsFile)
+	for idscanner.Scan() {
+		line := idscanner.Text()
+
+		parts := strings.Fields(line)
+		foundid := parts[1]
+
+		if revokeid != foundid {
+			_, _ = fmt.Fprintf(newHostidsFile, "%s\n", idscanner.Text())
+		}
+	}
+
+	// overwrite the hostids file with the temp file
+	err = os.Rename("temp.txt", "hostids.txt")
+	if err != nil {
+		return fmt.Errorf("error overwriting the hostids file")
+	}
+
+	certPath := filepath.Join("contacts", revokeid+".crt")
+
+	err = os.Remove(certPath)
+	if err != nil {
+		return fmt.Errorf("error removing the certificate")
+	}
+
+	return nil
+}
+
+func revoke_certificate() error {
+	// get the time of revocation
+	currentTime := time.Now()
+
+	// create a string of the time
+	dateString := currentTime.Format("2006-01-02 15-04-05")
+
+	dateString = strings.ReplaceAll(dateString, " ", "_")
+
+	revDir := filepath.Join("revocation", dateString)
+
+	// create the directory
+	err := os.MkdirAll(revDir, 0755)
+	if err != nil {
+		return fmt.Errorf("error while creating the revocation info directory: %v", err)
+	}
+
+	// create toupdate
+	toupdate, err := os.Create(filepath.Join(revDir, "toupdate.txt"))
+	if err != nil {
+		return fmt.Errorf("error opening the toupdate file")
+	}
+
+	// move old certificate and key to the directory
+	if err = os.Rename("my.key", filepath.Join(revDir, "my.key")); err != nil {
+		return fmt.Errorf("error moving the private key to the revocation directory: %v", err)
+	}
+
+	if err = os.Rename("my.crt", filepath.Join(revDir, "my.crt")); err != nil {
+		return fmt.Errorf("error moving the certificate to the revocation directory: %v", err)
+	}
+
+	// open the hostids file
+
+	hostIDFile, err := os.Open("hostids.txt")
+	if err != nil {
+		return fmt.Errorf("error while opening the host id file")
+	}
+
+	// get all ids from hostids and write to the toupdate file
+
+	scanner := bufio.NewScanner(hostIDFile)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		id := strings.Fields(line)[1]
+
+		_, err = toupdate.Seek(0, io.SeekEnd)
+		if err != nil {
+			return fmt.Errorf("error seeking end of toupdate file: %v", err)
+		}
+
+		if _, err = fmt.Fprintln(toupdate, id); err != nil {
+			return fmt.Errorf("error writing id to toupdate: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func send_revocation_signal(user *mdns.ServiceEntry, revDir string) error {
+
+	var conn *tls.Conn
+
+	// check if the matched service entry relates to a valid contact
+	found, _, _ := check_contact(user.InfoFields[0])
+
+	if !found {
+		return fmt.Errorf("the matched id did not correspond to a valid user")
+	}
+
+	cert, err := tls.LoadX509KeyPair(filepath.Join(revDir, "my.crt"), filepath.Join(revDir, "my.key"))
+	if err != nil {
+		return fmt.Errorf("failed to load server certificate and key: %v", err)
+	}
+
+	config := &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		VerifyPeerCertificate: verify_peer_cert,
+		InsecureSkipVerify:    true,
+	}
+
+	destination := user.AddrV4.String() + ":6969"
+
+	conn, err = tls.Dial("tcp", destination, config)
+	if err != nil {
+		return fmt.Errorf("connection failed: %v", err)
+	}
+
+	err = conn.Handshake()
+	if err != nil {
+		return fmt.Errorf("tls handshake failed: %v", err)
+	}
+
+	_, err = conn.Write([]byte{0x05})
+	if err != nil {
+		return fmt.Errorf("error sending the revoke signal")
+	}
+
+	return nil
+}
+
+func update_contacts_revocation_status() {
+
+	// get the available peers
+	onlinePeers := peer_discovery()
+
+	// get all of the revoked certificates that still need updating from the revocation directory
+	revoked, err := os.ReadDir("revocation")
+	if err != nil {
+		fmt.Printf("error while reading the files from %s: %v", "revokation", err)
+	}
+
+	// iterate through the subdirectories relating to revoked certificates
+	for _, revDir := range revoked {
+
+		// filename of the toupdate.txt file
+		updateFilePath := filepath.Join("revocation", revDir.Name(), "toupdate.txt")
+
+		// open the original file
+		updateFile, err := os.Open(updateFilePath)
+		if err != nil {
+			fmt.Printf("error while opening the toupdate file in %s: %v", revDir.Name(), err)
+		}
+
+		check_empty, err := os.ReadFile(updateFilePath)
+		if err != nil {
+			fmt.Printf("error checking whether the to update file is empty: %v", err)
+		}
+		if len(check_empty) == 0 {
+			err = updateFile.Close()
+			if err != nil {
+				fmt.Printf("error closing the update file for directory deletion: %v", err)
+			}
+			err = os.RemoveAll(filepath.Join("revocation", revDir.Name()))
+			if err != nil {
+				fmt.Printf("error while clearing the obsolete revocation file: %v", err)
+			}
+			return
+		}
+
+		// create a new file
+		newUpdateFilePath := filepath.Join("revocation", revDir.Name(), "temp.txt")
+		newUpdateFile, err := os.Create(newUpdateFilePath)
+		if err != nil {
+			fmt.Printf("error while creating the temp file: %v", err)
+		}
+
+		// consider each id
+		idscanner := bufio.NewScanner(updateFile)
+		for idscanner.Scan() {
+
+			// the id to be updated
+			updateId := idscanner.Text()
+
+			// whether the id was updated
+			updated := false
+
+			// check if it matches any of the ids of online peers
+			for _, online := range onlinePeers {
+
+				// check whether the user we still need to update is online
+				if updateId == online.InfoFields[0] {
+
+					// if they are online, send the revocation signal
+					err = send_revocation_signal(online, filepath.Join("revocation", revDir.Name()))
+
+					if err != nil { // the update failed for the matched id
+						fmt.Printf("error while sending the revocation signal")
+
+					} else { // the update succeeded for the matched id, we do not write them to the new update file
+						updated = true
+					}
+				}
+			}
+
+			// check whether the id to update, was updated
+			// if not, then we need to write them back to file as still needing to be updated
+			if !updated {
+				_, _ = fmt.Fprintln(newUpdateFile, updateId)
+			}
+		}
+
+		err = os.Truncate(updateFilePath, 0)
+		if err != nil {
+			fmt.Printf("error truncating old update file: %v\n", err)
+		}
+
+		_, err = io.Copy(updateFile, newUpdateFile)
+		if err != nil {
+			fmt.Printf("error copying contents of new update file")
+		}
+
+		// close the files
+		err = newUpdateFile.Close()
+		if err != nil {
+			fmt.Printf("error while closing new update file %v\n", err)
+		}
+		err = updateFile.Close()
+		if err != nil {
+			fmt.Printf("error while closing update file %v\n", err)
+		}
+
+		// remove new update file
+		err = os.Remove(newUpdateFilePath)
+		if err != nil {
+			fmt.Printf("error removing the temp update file: %v\n", err)
+		}
+
+		// overwrite the old update file with the users who still need to be updated
+		//err = os.Rename(newUpdateFilePath, updateFilePath)
+		//if err != nil {
+		//	fmt.Printf("error while overwriting the old to update file: %v", err)
+		//}
+	}
+}
+
 func get_id() (string, error) {
 	// read the unique id
 	file, err := os.Open("id.txt")
@@ -852,8 +1198,12 @@ func generate_identifier() error {
 	}
 	defer file.Close()
 
-	random := rand.Intn(999000)
-	random = random + 1000
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(999000)))
+	if err != nil {
+		return fmt.Errorf("error generating identifier: %v", err)
+	}
+
+	random := int(n.Int64()) + 1000
 
 	_, err = fmt.Fprintf(file, "%d", random)
 	if err != nil {
@@ -894,23 +1244,294 @@ func generate_self_signed() error {
 	return nil
 }
 
-// handle input on the main menu and allow the user to
-// chat
-// migrate key
-// help
-// quit
-func handle_main_menu(input string) string {
-	if input == "chat" || input == "1" {
-		initiate_chat()
-		return "good"
-	} else if input == "quit" || input == "2" {
-		return "quit"
+func create_password() error {
+	fmt.Printf("Select a password to login tp the app. No spaces or newlines!!!\n\n")
+
+	// create file
+	file, err := os.Create("password.txt")
+	if err != nil {
+		return fmt.Errorf("error while creating the password file: %v", err)
 	}
 
-	fmt.Println("The input does not correspond to a valid command")
-	return "not good"
+	var input string
+	fmt.Scanln(&input)
+
+	make_pd_key(input)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(input), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to generate hash while creating password: %v", err)
+	}
+
+	_, err = fmt.Fprintf(file, "%s", hash)
+	if err != nil {
+		return fmt.Errorf("error writing the hash of the password to the password file: %v", err)
+	}
+
+	return nil
 }
 
+func encrypt(plaintext []byte, key []byte) (encrypted []byte) {
+
+	//Create a new Cipher Block from the key
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		log.Fatalf("error while creating cipher block: %v", err)
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		log.Fatalf("error while creating new gcm: %v", err)
+	}
+
+	//Create a nonce. Nonce should be from GCM
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		log.Fatalf("error while generating nonce: %v", err)
+	}
+
+	//Encrypt the data using aesGCM.Seal
+	//Since we don't want to save the nonce somewhere else in this case, we add it as a prefix to the encrypted data. The first nonce argument in Seal is the prefix.
+	ciphertext := aesGCM.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext
+}
+
+func encrypt_all_files() (error, error) {
+
+	// encrypt the files
+	err1 := encrypt_directory("inbox", PDKey)
+	if err1 != nil {
+		fmt.Printf("error while encrypting the inbox: inbox may be corrupted: %v", err1)
+	}
+
+	err2 := encrypt_file("my.key", PDKey)
+	if err2 != nil {
+		fmt.Printf("error while encrypting the private key: %v", err2)
+	}
+
+	return err1, err2
+}
+
+func encrypt_directory(path string, key []byte) error {
+	// get all of the files in the directory
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("error while reading the files to encrypt from %s: %v", path, err)
+	}
+
+	// iterate through the files of the current directory
+	for _, file := range files {
+
+		// generate the path of the new file
+		newPath := filepath.Join(path, file.Name())
+
+		// get info on the current file
+		finfo, err := os.Stat(newPath)
+		if err != nil {
+			return fmt.Errorf("error while getting information on file to encrypt: %v", err)
+		}
+
+		// check whether the current file is a directory
+		if finfo.IsDir() { // if so recurse
+
+			err := encrypt_directory(newPath, key)
+			if err != nil {
+				return fmt.Errorf("error while encrypting %s: %v", newPath, err)
+			}
+
+		} else { // otherwise encrypt the file
+			err := encrypt_file(newPath, key)
+			if err != nil {
+				return fmt.Errorf("error while encrpyting the file %s: %v", newPath, err)
+			}
+		}
+
+	}
+
+	return nil
+}
+
+func encrypt_file(path string, key []byte) error {
+
+	// get the contents of the file
+	plaintext, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("error while reading contents of the target file to decrypt: %v", err)
+	}
+
+	ciphertext := encrypt(plaintext, key)
+
+	err = os.WriteFile(path, []byte(ciphertext), 0644)
+	if err != nil {
+		return fmt.Errorf("error while encrypting the target file: %v", err)
+	}
+
+	return nil
+}
+
+func decrypt(enc []byte, key []byte) (decrypted []byte) {
+
+	//Create a new Cipher Block from the key
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	//Create a new GCM
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	//Get the nonce size
+	nonceSize := aesGCM.NonceSize()
+
+	//Extract the nonce from the encrypted data
+	nonce, ciphertext := enc[:nonceSize], enc[nonceSize:]
+
+	//Decrypt the data
+	plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	//return fmt.Sprintf("%s", plaintext)
+	return plaintext
+}
+
+func decrypt_file(path string, key []byte) error {
+
+	// get the contents of the file
+	ciphertext, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("error while reading contents of the target file to decrypt: %v", err)
+	}
+
+	plaintext := decrypt(ciphertext, key)
+
+	err = os.WriteFile(path, plaintext, 0644)
+	if err != nil {
+		return fmt.Errorf("error while decrypting the target file: %v", err)
+	}
+
+	return nil
+}
+
+func decrypt_directory(path string, key []byte) error {
+	// get all of the files in the directory
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("error while reading the files to decrypt from %s: %v", path, err)
+	}
+
+	// iterate through the files of the current directory
+	for _, file := range files {
+
+		// generate the path of the new file
+		newPath := filepath.Join(path, file.Name())
+
+		// get info on the current file
+		finfo, err := os.Stat(newPath)
+		if err != nil {
+			return fmt.Errorf("error while getting information on file to decrypt: %v", err)
+		}
+
+		// check whether the current file is a directory
+		if finfo.IsDir() { // if so recurse
+
+			err := decrypt_directory(newPath, key)
+			if err != nil {
+				return fmt.Errorf("error while decrypting %s: %v", newPath, err)
+			}
+
+		} else { // otherwise encrypt the file
+			err := decrypt_file(newPath, key)
+			if err != nil {
+				return fmt.Errorf("error while decrpyting the file %s: %v", newPath, err)
+			}
+		}
+
+	}
+
+	return nil
+}
+
+func decrypt_all_files(password string) error {
+
+	make_pd_key(password)
+
+	err := decrypt_directory("inbox", PDKey)
+	if err != nil {
+		return fmt.Errorf("error while decrypting the inbox: inbox may be corrupted: %v", err)
+	}
+
+	err = decrypt_file("my.key", PDKey)
+	if err != nil {
+		return fmt.Errorf("error while decrypting the private key: %v", err)
+	}
+
+	return nil
+}
+
+func make_pd_key(password string) {
+	salt := []byte("salt")
+
+	iterations := 5000
+	byteLen := 32
+
+	// derive key using PBKDF2
+	key := pbkdf2.Key([]byte(password), salt, iterations, byteLen, sha256.New)
+
+	// save the key to the global variable
+
+	PDKey = key
+}
+
+func login() error {
+
+	// check for existence of passord file
+	_, err := os.Stat("password.txt")
+
+	if os.IsNotExist(err) { // if does not exist, means it is the first use of the app
+
+		// let the user select a password
+		err := create_password()
+		if err != nil {
+			return fmt.Errorf("error while creating password: %v", err)
+		}
+		return nil
+	} else if err == nil { // the password file exists, we can check
+
+		hash, err := os.ReadFile("password.txt")
+		if err != nil {
+			return fmt.Errorf("error reading the hash from the password file: %v", err)
+		}
+
+		fmt.Printf("Hello!\nEnter Your Password: ")
+
+		var password string
+		for {
+			fmt.Scanln(&password)
+
+			err = bcrypt.CompareHashAndPassword(hash, []byte(password))
+			if err != nil {
+				fmt.Printf("That was not the correct password. Try again\nEnter Your Password: ")
+				continue
+			} else {
+				err := decrypt_all_files(password)
+				if err != nil {
+					return fmt.Errorf("error while decrypting files: %v", err)
+				}
+
+				return nil
+			}
+		}
+	} else { // another error occured
+		return fmt.Errorf("error checking for password file: %v", err)
+	}
+}
+
+// check for the existence of necessary directories and files
 func app_startup_checks() {
 
 	// generate unique identifier if not exists
@@ -961,8 +1582,8 @@ func app_startup_checks() {
 	}
 
 	// generate key migration directory
-	if _, err := os.Stat("toupdate"); os.IsNotExist(err) {
-		err := os.Mkdir("toupdate", 0755)
+	if _, err := os.Stat("revocation"); os.IsNotExist(err) {
+		err := os.Mkdir("revocation", 0755)
 		if err != nil {
 			fmt.Printf("Failed to create the key migration directory: %v\n", err)
 		}
@@ -970,8 +1591,63 @@ func app_startup_checks() {
 
 }
 
+// handle input on the main menu and allow the user to
+// chat
+// migrate key
+// help
+// quit
+func handle_main_menu(input string) string {
+	if input == "chat" || input == "1" {
+		initiate_chat()
+		return "good"
+	} else if input == "quit" || input == "2" {
+		return "quit"
+	} else if input == "revoke" {
+		err := revoke_certificate()
+		if err != nil {
+			fmt.Printf("error while revoking certificate: %v", err)
+			return "bad revoke"
+		}
+
+		// make the new certificate
+		err = generate_self_signed()
+		if err != nil {
+			return "bad revoke"
+		}
+
+		return "good revoke"
+	}
+
+	fmt.Println("The input does not correspond to a valid command")
+	return "not good"
+}
+
 func main() {
+	// allocate the password derived key
+	PDKey = make([]byte, 32)
+
 	// login
+	err := login()
+	if err != nil {
+		log.Fatalf("The login failed: %v", err)
+	}
+
+	// make a channel to listen for shutdown signals
+	shutdownSig := make(chan os.Signal, 1)
+
+	signal.Notify(shutdownSig, syscall.SIGINT, syscall.SIGTERM)
+
+	// start go routine to handle the shutdown signal
+	go func() {
+
+		<-shutdownSig
+
+		fmt.Println("Received shutdown signal. Encrypting files...")
+
+		_, _ = encrypt_all_files()
+
+		os.Exit(0)
+	}()
 
 	// startup checks
 	app_startup_checks()
@@ -986,6 +1662,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load server certificate and key: %v", err)
 	}
+
+	// start the go routine for updating peers with revocation information
+	go func() {
+		for range time.Tick(60 * time.Second) {
+			update_contacts_revocation_status()
+		}
+	}()
 
 	// configure the tls setup
 	tlsConfig := &tls.Config{
@@ -1057,14 +1740,34 @@ func main() {
 	var input string
 
 	for {
-		fmt.Printf("Main Menu\nAvailable Options\n1. chat\n2. quit\n")
+		fmt.Printf("Main Menu\nAvailable Options\n1. chat\n2. quit\n3. revoke\n")
 		fmt.Print("sm> ")
 		fmt.Scanln(&input)
 
 		res := handle_main_menu(input)
 
 		if res == "quit" {
+			err1, err2 := encrypt_all_files()
+			if err1 != nil {
+				fmt.Printf("Please resolve error to safely log out: %v", err1)
+				continue
+			} else if err2 != nil {
+				fmt.Printf("Please resolve error to safely log out: %v", err2)
+				continue
+			}
+			break
+		} else if res == "good revoke" {
+			fmt.Printf("Certificate has been revoked :D\nProgram now exiting\n")
+
+			err1, err2 := encrypt_all_files()
+			if err1 != nil {
+				fmt.Printf("error encrypting the inbox: %v", err1)
+			} else if err2 != nil {
+				fmt.Printf("error encrypting private key: %v", err2)
+			}
+
 			break
 		}
 	}
+
 }
