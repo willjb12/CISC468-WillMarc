@@ -18,6 +18,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -435,7 +437,7 @@ func tls_connection_handler(conn *tls.Conn) {
 
 	// persistently read messages from the connection and write them to the inbox
 	for {
-		buffer := make([]byte, 1024)
+		buffer := make([]byte, 2048)
 
 		n, err := conn.Read(buffer)
 		if err != nil {
@@ -450,10 +452,19 @@ func tls_connection_handler(conn *tls.Conn) {
 		}
 
 		if buffer[0] == 0x05 {
-			err = revoke_contact(id)
+			err = revoke_contact(id, buffer[1:n])
 			if err != nil {
 				fmt.Printf("error while trying to revoke contact: %v", err)
 			}
+			break
+		}
+
+		if buffer[0] == 0x07 {
+			err = save_file(id, buffer[1:n])
+			if err != nil {
+				fmt.Printf("error saving the received file: %v", err)
+			}
+			continue
 		}
 
 		if connection.active {
@@ -566,12 +577,21 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 		// go routine to read incoming messages
 		go func(file *os.File, inboxMutex *sync.Mutex, username string, conn *tls.Conn) {
 			for {
-				buffer := make([]byte, 1024)
+				buffer := make([]byte, 2048)
 
 				n, err := conn.Read(buffer)
 				if err != nil {
 					closureChan <- true
 					break
+				}
+
+				if buffer[0] == 0x07 {
+					fmt.Printf("You have receieved a file, saving now\nThe length of the file is: %d\n", n-1)
+					err = save_file(userID.ID, buffer[1:n])
+					if err != nil {
+						fmt.Printf("error saving the received file: %v", err)
+					}
+					continue
 				}
 
 				err = write_to_inbox(file, username, string(buffer[:n]), inboxMutex)
@@ -609,6 +629,15 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 				}
 
 				input = strings.TrimSpace(input)
+
+				if strings.HasPrefix(input, "sendfile") {
+					fmt.Printf("You are sending a file\n")
+					err = send_file(input[9:], conn)
+					if err != nil {
+						fmt.Printf("the file failed to send: %v", err)
+					}
+					continue
+				}
 
 				if input != "quit" { // if the input is not a quit signal send it into the connection
 					_, err := conn.Write([]byte(input))
@@ -652,6 +681,14 @@ func establish_tls_chat(userID HostID, ip net.IP) error {
 			}
 
 			input = strings.TrimSpace(input)
+
+			if strings.HasPrefix(input, "sendfile") {
+				err = send_file(input[9:], conn)
+				if err != nil {
+					fmt.Printf("the file failed to send: %v", err)
+				}
+				continue
+			}
 
 			if input != "quit" {
 				_, err := conn.Write([]byte(input))
@@ -766,6 +803,71 @@ func write_to_inbox(file *os.File, username string, message string, inboxMutex *
 	return nil
 }
 
+func send_file(filePath string, conn *tls.Conn) error {
+
+	fmt.Printf("sending the file\n")
+	// read the file to send
+	contents, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("error reading the file contents: %v", err)
+	}
+
+	fmt.Printf("the length of the file is: %d\n", len(contents))
+
+	fileMess := append([]byte{0x07}, contents...)
+
+	_, err = conn.Write(fileMess)
+	if err != nil {
+		return fmt.Errorf("error writing the file to the connection: %v", err)
+	}
+
+	return nil
+}
+
+func save_file(id string, contents []byte) error {
+
+	// make the inbox filepath
+	inboxPath := filepath.Join("inbox", id)
+
+	// read files from the directory
+	files, err := os.ReadDir(inboxPath)
+	if err != nil {
+		return fmt.Errorf("error reading files from inbox")
+	}
+
+	// get the highest filenum
+	curnum := 0
+
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "file") {
+			extensionInd := strings.LastIndex(file.Name(), ".")
+			filenum, err := strconv.Atoi(file.Name()[4:extensionInd])
+			if err != nil {
+				return fmt.Errorf("error converting filenum to int: %v", err)
+			}
+
+			if filenum > curnum {
+				curnum = filenum
+			}
+		}
+	}
+
+	// write the file to the inbox directory
+	newFilePath := filepath.Join("inbox", id, "file"+strconv.Itoa(curnum+1))
+
+	newFile, err := os.Create(newFilePath)
+	if err != nil {
+		return fmt.Errorf("error creating the new file: %v", err)
+	}
+
+	_, err = newFile.Write(contents)
+	if err != nil {
+		return fmt.Errorf("error writing the contents to the file: %v", err)
+	}
+
+	return nil
+}
+
 func check_contact(checkID string) (bool, HostID, error) {
 	var match HostID
 	found := false
@@ -829,7 +931,6 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	pair = HostID{Hostname: hostName, ID: id}
 
 	// check if an entry already exists for that id
-	// this could also mean that we have revoked our certificate
 	found, _, err := check_contact(id)
 	if err != nil {
 		return pair, fmt.Errorf("error checking hostids file while adding contact: %v", err)
@@ -873,7 +974,7 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 		return pair, fmt.Errorf("error seeking end of hostids file: %v", err)
 	}
 
-	if _, err = file.Write([]byte(hostName + " " + id)); err != nil {
+	if _, err = file.Write([]byte(hostName + " " + id + "\n")); err != nil {
 		return pair, fmt.Errorf("error writing contact to file: %v", err)
 	}
 
@@ -907,44 +1008,35 @@ func add_new_contact(block *pem.Block) (HostID, error) {
 	return pair, nil
 }
 
-func revoke_contact(revokeid string) error {
+func revoke_contact(revokeid string, byteCert []byte) error {
 
-	// open the original file
-	hostidsFile, err := os.Open("hostids.txt")
+	block, _ := pem.Decode(byteCert)
+
+	// write the contact to the certificate directory
+	contactPath := filepath.Join("contacts", revokeid+".crt")
+
+	err := os.Remove(contactPath)
 	if err != nil {
-		fmt.Printf("error while opening the hostids file: %v", err)
+		return fmt.Errorf("error removing the certificate: %v", err)
 	}
 
-	// create a new file
-	newHostidsFile, err := os.Create("temp.txt")
+	err = os.WriteFile(contactPath, pem.EncodeToMemory(block), 0644)
 	if err != nil {
-		fmt.Printf("error while creating the temp file: %v", err)
+		return fmt.Errorf("failed to overwrite certificate: %v", err)
 	}
 
-	// consider each id and write all besides the one revoked to the temp file
-	idscanner := bufio.NewScanner(hostidsFile)
-	for idscanner.Scan() {
-		line := idscanner.Text()
+	emptyMut := new(sync.Mutex)
 
-		parts := strings.Fields(line)
-		foundid := parts[1]
-
-		if revokeid != foundid {
-			_, _ = fmt.Fprintf(newHostidsFile, "%s\n", idscanner.Text())
-		}
+	// open the inbox file
+	inboxPath := filepath.Join("inbox", revokeid, revokeid+".txt")
+	file, err := os.OpenFile(inboxPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open the inbox file: %v", err)
 	}
 
-	// overwrite the hostids file with the temp file
-	err = os.Rename("temp.txt", "hostids.txt")
+	err = write_to_inbox(file, "SYSTEM", "THE CONTACT HAS CHANGED PRIVATE KEY. PLEASE BE WARY OF AN IMPERSONATOR.", emptyMut)
 	if err != nil {
-		return fmt.Errorf("error overwriting the hostids file")
-	}
-
-	certPath := filepath.Join("contacts", revokeid+".crt")
-
-	err = os.Remove(certPath)
-	if err != nil {
-		return fmt.Errorf("error removing the certificate")
+		return fmt.Errorf("error while writing the warning string to file")
 	}
 
 	return nil
@@ -972,6 +1064,7 @@ func revoke_certificate() error {
 	if err != nil {
 		return fmt.Errorf("error opening the toupdate file")
 	}
+	defer toupdate.Close()
 
 	// move old certificate and key to the directory
 	if err = os.Rename("my.key", filepath.Join(revDir, "my.key")); err != nil {
@@ -980,6 +1073,12 @@ func revoke_certificate() error {
 
 	if err = os.Rename("my.crt", filepath.Join(revDir, "my.crt")); err != nil {
 		return fmt.Errorf("error moving the certificate to the revocation directory: %v", err)
+	}
+
+	// make the new certificate
+	err = generate_self_signed()
+	if err != nil {
+		return fmt.Errorf("error generating new certificate: %v", err)
 	}
 
 	// open the hostids file
@@ -995,6 +1094,10 @@ func revoke_certificate() error {
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if len(strings.Fields(line)) == 0 {
+			break
+		}
 
 		id := strings.Fields(line)[1]
 
@@ -1022,6 +1125,7 @@ func send_revocation_signal(user *mdns.ServiceEntry, revDir string) error {
 		return fmt.Errorf("the matched id did not correspond to a valid user")
 	}
 
+	// get the certificate they have on file for us
 	cert, err := tls.LoadX509KeyPair(filepath.Join(revDir, "my.crt"), filepath.Join(revDir, "my.key"))
 	if err != nil {
 		return fmt.Errorf("failed to load server certificate and key: %v", err)
@@ -1045,7 +1149,16 @@ func send_revocation_signal(user *mdns.ServiceEntry, revDir string) error {
 		return fmt.Errorf("tls handshake failed: %v", err)
 	}
 
-	_, err = conn.Write([]byte{0x05})
+	// get new certificate
+	newCert, err := os.ReadFile("my.crt")
+	if err != nil {
+		return fmt.Errorf("error occurred while new cert from file: %v", err)
+	}
+
+	// create the revocation message
+	revMess := append([]byte{0x05}, newCert...)
+
+	_, err = conn.Write(revMess)
 	if err != nil {
 		return fmt.Errorf("error sending the revoke signal")
 	}
@@ -1134,37 +1247,52 @@ func update_contacts_revocation_status() {
 			}
 		}
 
-		err = os.Truncate(updateFilePath, 0)
-		if err != nil {
-			fmt.Printf("error truncating old update file: %v\n", err)
+		system := runtime.GOOS
+
+		if system == "windows" {
+
+			// clear contents of old update file
+			err = os.Truncate(updateFilePath, 0)
+			if err != nil {
+				fmt.Printf("error truncating old update file: %v\n", err)
+			}
+
+			// write new update file to old
+			_, err = io.Copy(updateFile, newUpdateFile)
+			if err != nil {
+				fmt.Printf("error copying contents of new update file: %v", err)
+			}
+
+			err = newUpdateFile.Close()
+			if err != nil {
+				fmt.Printf("error while closing new update file %v\n", err)
+			}
+
+			// remove temp update file
+			err = os.Remove(newUpdateFilePath)
+			if err != nil {
+				fmt.Printf("error removing the temp update file: %v\n", err)
+			}
 		}
 
-		_, err = io.Copy(updateFile, newUpdateFile)
-		if err != nil {
-			fmt.Printf("error copying contents of new update file")
-		}
+		if system == "linux" {
 
-		// close the files
-		err = newUpdateFile.Close()
-		if err != nil {
-			fmt.Printf("error while closing new update file %v\n", err)
-		}
-		err = updateFile.Close()
-		if err != nil {
-			fmt.Printf("error while closing update file %v\n", err)
-		}
+			// close the files
+			err = newUpdateFile.Close()
+			if err != nil {
+				fmt.Printf("error while closing new update file %v\n", err)
+			}
+			err = updateFile.Close()
+			if err != nil {
+				fmt.Printf("error while closing update file %v\n", err)
+			}
 
-		// remove new update file
-		err = os.Remove(newUpdateFilePath)
-		if err != nil {
-			fmt.Printf("error removing the temp update file: %v\n", err)
+			// overwrite the old update file with the users who still need to be updated
+			err = os.Rename(newUpdateFilePath, updateFilePath)
+			if err != nil {
+				fmt.Printf("error while overwriting the old to update file: %v", err)
+			}
 		}
-
-		// overwrite the old update file with the users who still need to be updated
-		//err = os.Rename(newUpdateFilePath, updateFilePath)
-		//if err != nil {
-		//	fmt.Printf("error while overwriting the old to update file: %v", err)
-		//}
 	}
 }
 
@@ -1606,12 +1734,6 @@ func handle_main_menu(input string) string {
 		err := revoke_certificate()
 		if err != nil {
 			fmt.Printf("error while revoking certificate: %v", err)
-			return "bad revoke"
-		}
-
-		// make the new certificate
-		err = generate_self_signed()
-		if err != nil {
 			return "bad revoke"
 		}
 
