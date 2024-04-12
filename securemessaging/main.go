@@ -117,7 +117,7 @@ func print_nice_columns(discovered []*mdns.ServiceEntry) {
 func announce_presence() *mdns.Server {
 	host, _ := os.Hostname()
 	id, _ := get_id()
-	service, _ := mdns.NewMDNSService(host, "_securemessaging._udp", "", "", 8000, nil, []string{id})
+	service, _ := mdns.NewMDNSService(host, "_securemessaging._udp.", "", "", 8000, nil, []string{id})
 
 	// Create the mDNS server, defer shutdown
 	server, _ := mdns.NewServer(&mdns.Config{Zone: service})
@@ -126,7 +126,7 @@ func announce_presence() *mdns.Server {
 }
 
 func peer_discovery() []*mdns.ServiceEntry {
-	params := mdns.DefaultParams("_securemessaging._udp")
+	params := mdns.DefaultParams("_securemessaging._udp.")
 
 	entriesCh := make(chan *mdns.ServiceEntry, 10)
 
